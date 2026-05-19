@@ -1,0 +1,320 @@
+/* ================================================================== */
+/* FLXSEDIMNT.pli — Sediment Layers: Stack of constraint corrections */
+/* Corrections accumulate in layers. Correctness density measures     */
+/* how much of the constraint space is well-specified.                */
+/*                                                                    */
+/* PL/I's BASED pointers and AREA allocation let us build a stack    */
+/* of sediment layers dynamically — stack management via pointer      */
+/* arithmetic, just like the geological metaphor.                     */
+/* ================================================================== */
+
+FLXSEDIMNT: PROCEDURE OPTIONS(MAIN);
+
+    /* ---- Constants ---- */
+    DECLARE MAX_LAYERS FIXED BIN(15) INIT(50);
+    DECLARE MAX_CONSTRAINTS FIXED BIN(8) INIT(8);
+
+    /* ---- Sediment layer structure ---- */
+    /* Each layer is a correction to one constraint's bounds */
+    DECLARE 1 SEDIMENT(50),
+        2 CONSTRAINT_IDX  FIXED BIN(8),   /* which constraint */
+        2 OLD_LO          DEC FIXED(15,4), /* previous lower bound */
+        2 OLD_HI          DEC FIXED(15,4), /* previous upper bound */
+        2 NEW_LO          DEC FIXED(15,4), /* corrected lower bound */
+        2 NEW_HI          DEC FIXED(15,4), /* corrected upper bound */
+        2 OVERRIDE_PASS   BIT(1),          /* '1'B = force pass regardless */
+        2 REASON          CHAR(32),        /* why this correction */
+        2 TIMESTAMP       DEC FIXED(15,0), /* when applied */
+        2 ACTIVE          BIT(1);          /* '1'B = currently applied */
+
+    DECLARE SEDIMENT_COUNT FIXED BIN(8) INIT(0);
+
+    /* ---- Stack pointer for layer management ---- */
+    DECLARE STACK_PTR FIXED BIN(8) INIT(0);
+
+    /* ---- Constraint structure (mirrors FLXCHECK) ---- */
+    DECLARE 1 CONSTRAINTS(8),
+        2 LO        DEC FIXED(15,4),
+        2 HI        DEC FIXED(15,4),
+        2 SEVERITY  FIXED BIN(8),
+        2 VIOLATED  BIT(1),
+        2 NAME      CHAR(16);
+
+    DECLARE INPUT_VALUES(8) DEC FIXED(15,4);
+    DECLARE CONSTRAINT_COUNT FIXED BIN(8) INIT(0);
+
+    /* ---- Result ---- */
+    DECLARE 1 RESULT,
+        2 ERROR_MASK  BIT(8),
+        2 VIOLATED    FIXED BIN(8),
+        2 SEVERITY    FIXED BIN(8),
+        2 PASSED      BIT(1);
+
+    /* ---- Work variables ---- */
+    DECLARE (I, J) FIXED BIN(8);
+    DECLARE LAYER_APPLIED FIXED BIN(8);
+    DECLARE TOTAL_RANGE DEC FIXED(15,4);
+    DECLARE SPECIFIED_RANGE DEC FIXED(15,4);
+    DECLARE DENSITY DEC FIXED(15,4);
+
+    /* ================================================================ */
+    /* MAIN: self-test                                                  */
+    /* ================================================================ */
+    PUT SKIP LIST('FLXSEDIMNT — Sediment Layer Engine (PL/I) v1.0');
+    PUT SKIP LIST('================================================');
+    CALL SELF_TEST;
+
+    /* ================================================================ */
+    /* SELF_TEST                                                        */
+    /* ================================================================ */
+SELF_TEST: PROCEDURE;
+
+    /* Setup baseline constraints */
+    CALL INIT_ALL;
+    CONSTRAINT_COUNT = 3;
+    LO(1) = -40;  HI(1) = 85;   SEVERITY(1) = 1;  NAME(1) = 'temperature';
+    LO(2) = 800;  HI(2) = 1200; SEVERITY(2) = 2;  NAME(2) = 'pressure';
+    LO(3) = 0;    HI(3) = 50;   SEVERITY(3) = 1;  NAME(3) = 'voltage';
+
+    /* TEST 1: Push a sediment layer that extends temperature bounds */
+    CALL PUSH_LAYER(1, -40, 85, -40, 105, '0'B, 'extended_temp_range', 20260519);
+    IF SEDIMENT_COUNT ^= 1 THEN
+        PUT SKIP LIST('  FAIL: Test 1 (expected 1 layer)');
+    ELSE
+        PUT SKIP LIST('  PASS: Test 1 (pushed 1 layer)');
+
+    /* TEST 2: Apply sediment — should extend HI to 105 */
+    CALL APPLY_SEDIMENT;
+    IF HI(1) = 105 THEN
+        PUT SKIP LIST('  PASS: Test 2 (sediment extended HI to 105)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 2 (HI=' || HI(1) || ', expected 105)');
+
+    /* TEST 3: Value at 95 now passes with extended bounds */
+    INPUT_VALUES(1) = 95;
+    CALL VALIDATE_ALL;
+    IF PASSED = '1'B THEN
+        PUT SKIP LIST('  PASS: Test 3 (95 passes with sediment)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 3 (95 should pass with sediment)');
+
+    /* TEST 4: Pop layer — bounds should revert */
+    CALL POP_LAYER;
+    IF HI(1) = 85 THEN
+        PUT SKIP LIST('  PASS: Test 4 (pop reverted HI to 85)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 4 (HI=' || HI(1) || ', expected 85)');
+
+    /* TEST 5: Value at 95 now fails without sediment */
+    INPUT_VALUES(1) = 95;
+    CALL VALIDATE_ALL;
+    IF PASSED = '0'B THEN
+        PUT SKIP LIST('  PASS: Test 5 (95 fails without sediment)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 5 (95 should fail without sediment)');
+
+    /* TEST 6: Correctness density */
+    /* Push 2 layers covering constraints 1 and 2 */
+    CALL PUSH_LAYER(1, -40, 85, -40, 105, '0'B, 'ext_temp', 20260519);
+    CALL PUSH_LAYER(2, 800, 1200, 750, 1300, '0'B, 'ext_press', 20260519);
+    CALL APPLY_SEDIMENT;
+
+    CALL COMPUTE_DENSITY;
+    /* Total range = (105-(-40)) + (1300-750) + (50-0) = 145 + 550 + 50 = 745 */
+    PUT SKIP LIST('  INFO: Correctness density = ' || DENSITY);
+
+    /* TEST 7: Override-pass layer */
+    CALL INIT_ALL;
+    CONSTRAINT_COUNT = 1;
+    LO(1) = 0;  HI(1) = 100;  SEVERITY(1) = 1;
+    CALL PUSH_LAYER(1, 0, 100, 0, 100, '1'B, 'force_pass', 20260519);
+    CALL APPLY_SEDIMENT;
+
+    INPUT_VALUES(1) = 999;
+    CALL VALIDATE_ALL;
+    IF PASSED = '1'B THEN
+        PUT SKIP LIST('  PASS: Test 7 (override-pass forces pass)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 7 (override should force pass)');
+
+    PUT SKIP LIST('Self-test complete.');
+
+END SELF_TEST;
+
+    /* ================================================================ */
+    /* INIT_ALL: Zero everything                                        */
+    /* ================================================================ */
+INIT_ALL: PROCEDURE;
+    DECLARE I FIXED BIN(8);
+    DO I = 1 TO MAX_CONSTRAINTS;
+        LO(I) = 0;  HI(I) = 0;  SEVERITY(I) = 0;
+        VIOLATED(I) = '0'B;  NAME(I) = '';
+        INPUT_VALUES(I) = 0;
+    END;
+    DO I = 1 TO MAX_LAYERS;
+        CONSTRAINT_IDX(I) = 0;
+        OLD_LO(I) = 0;  OLD_HI(I) = 0;
+        NEW_LO(I) = 0;  NEW_HI(I) = 0;
+        OVERRIDE_PASS(I) = '0'B;
+        REASON(I) = '';
+        TIMESTAMP(I) = 0;
+        ACTIVE(I) = '0'B;
+    END;
+    SEDIMENT_COUNT = 0;
+    STACK_PTR = 0;
+    CONSTRAINT_COUNT = 0;
+END INIT_ALL;
+
+    /* ================================================================ */
+    /* PUSH_LAYER: Add a sediment layer on top of the stack             */
+    /* ================================================================ */
+PUSH_LAYER: PROCEDURE(C_IDX, O_LO, O_HI, N_LO, N_HI, OVP, RSN, TSTAMP);
+    DECLARE (C_IDX) FIXED BIN(8);
+    DECLARE (O_LO, O_HI, N_LO, N_HI) DEC FIXED(15,4);
+    DECLARE OVP BIT(1);
+    DECLARE RSN CHAR(32);
+    DECLARE TSTAMP DEC FIXED(15,0);
+
+    IF SEDIMENT_COUNT >= MAX_LAYERS THEN
+        DO;
+            PUT SKIP LIST('ERROR: sediment stack overflow');
+            RETURN;
+        END;
+
+    SEDIMENT_COUNT = SEDIMENT_COUNT + 1;
+    STACK_PTR = SEDIMENT_COUNT;
+
+    CONSTRAINT_IDX(STACK_PTR) = C_IDX;
+    OLD_LO(STACK_PTR) = O_LO;
+    OLD_HI(STACK_PTR) = O_HI;
+    NEW_LO(STACK_PTR) = N_LO;
+    NEW_HI(STACK_PTR) = N_HI;
+    OVERRIDE_PASS(STACK_PTR) = OVP;
+    REASON(STACK_PTR) = RSN;
+    TIMESTAMP(STACK_PTR) = TSTAMP;
+    ACTIVE(STACK_PTR) = '1'B;
+END PUSH_LAYER;
+
+    /* ================================================================ */
+    /* POP_LAYER: Remove top layer and revert bounds                    */
+    /* ================================================================ */
+POP_LAYER: PROCEDURE;
+    DECLARE C_IDX FIXED BIN(8);
+
+    IF STACK_PTR <= 0 THEN
+        DO;
+            PUT SKIP LIST('WARNING: sediment stack underflow');
+            RETURN;
+        END;
+
+    C_IDX = CONSTRAINT_IDX(STACK_PTR);
+
+    /* Revert constraint bounds to OLD values */
+    IF C_IDX > 0 & C_IDX <= CONSTRAINT_COUNT THEN
+        DO;
+            LO(C_IDX) = OLD_LO(STACK_PTR);
+            HI(C_IDX) = OLD_HI(STACK_PTR);
+        END;
+
+    ACTIVE(STACK_PTR) = '0'B;
+    STACK_PTR = STACK_PTR - 1;
+    SEDIMENT_COUNT = SEDIMENT_COUNT - 1;
+END POP_LAYER;
+
+    /* ================================================================ */
+    /* APPLY_SEDIMENT: Layer corrections onto constraint bounds         */
+    /* Iterates bottom-to-top, applying each active layer               */
+    /* ================================================================ */
+APPLY_SEDIMENT: PROCEDURE;
+    LAYER_APPLIED = 0;
+    DO I = 1 TO SEDIMENT_COUNT;
+        IF ACTIVE(I) = '1'B THEN
+            DO;
+                J = CONSTRAINT_IDX(I);
+                IF J > 0 & J <= CONSTRAINT_COUNT THEN
+                    DO;
+                        /* Apply new bounds if specified */
+                        IF NEW_LO(I) ^= 0 THEN
+                            LO(J) = NEW_LO(I);
+                        IF NEW_HI(I) ^= 0 THEN
+                            HI(J) = NEW_HI(I);
+                        LAYER_APPLIED = LAYER_APPLIED + 1;
+                    END;
+            END;
+    END;
+END APPLY_SEDIMENT;
+
+    /* ================================================================ */
+    /* COMPUTE_DENSITY: Correctness density = specified / total range   */
+    /* Measures how well the constraint space is covered                 */
+    /* Uses PL/I's exact DECIMAL arithmetic — no floating point         */
+    /* ================================================================ */
+COMPUTE_DENSITY: PROCEDURE;
+    TOTAL_RANGE = 0;
+    SPECIFIED_RANGE = 0;
+
+    DO I = 1 TO CONSTRAINT_COUNT;
+        /* Total range for this constraint */
+        TOTAL_RANGE = TOTAL_RANGE + (HI(I) - LO(I));
+
+        /* Specified range: sum of sediment corrections */
+        DO J = 1 TO SEDIMENT_COUNT;
+            IF ACTIVE(J) = '1'B & CONSTRAINT_IDX(J) = I THEN
+                SPECIFIED_RANGE = SPECIFIED_RANGE + (NEW_HI(J) - NEW_LO(J));
+        END;
+    END;
+
+    /* Density = specified / total, as DECIMAL percentage × 100 */
+    IF TOTAL_RANGE > 0 THEN
+        DENSITY = (SPECIFIED_RANGE * 100) / TOTAL_RANGE;
+    ELSE
+        DENSITY = 0;
+
+    PUT SKIP LIST('  Layers applied: ' || LAYER_APPLIED);
+    PUT SKIP LIST('  Total range: ' || TOTAL_RANGE);
+    PUT SKIP LIST('  Specified range: ' || SPECIFIED_RANGE);
+END COMPUTE_DENSITY;
+
+    /* ================================================================ */
+    /* VALIDATE_ALL: Check constraints (with sediment already applied)  */
+    /* ================================================================ */
+VALIDATE_ALL: PROCEDURE;
+    DECLARE WORK_VAL DEC FIXED(15,4);
+    DECLARE SET_BIT BIT(8);
+
+    ERROR_MASK = '00000000'B;
+    VIOLATED = 0;
+    SEVERITY = 0;
+    PASSED = '1'B;
+
+    DO I = 1 TO CONSTRAINT_COUNT;
+        WORK_VAL = INPUT_VALUES(I);
+
+        /* Check override-pass from any active sediment layer */
+        DO J = 1 TO SEDIMENT_COUNT;
+            IF ACTIVE(J) = '1'B & CONSTRAINT_IDX(J) = I THEN
+                IF OVERRIDE_PASS(J) = '1'B THEN
+                    GO TO NEXT_CONSTRAINT;
+        END;
+
+        IF WORK_VAL < LO(I) | WORK_VAL > HI(I) THEN
+            DO;
+                VIOLATED(I) = '1'B;
+                VIOLATED = VIOLATED + 1;
+                PASSED = '0'B;
+                SET_BIT = '00000000'B;
+                SUBSTR(SET_BIT, I, 1) = '1'B;
+                ERROR_MASK = BOOL(ERROR_MASK, SET_BIT, '1111'B);
+            END;
+
+NEXT_CONSTRAINT:
+    END;
+
+    /* Compute severity */
+    DO I = 1 TO CONSTRAINT_COUNT;
+        IF SUBSTR(ERROR_MASK, I, 1) = '1'B THEN
+            SEVERITY = SEVERITY + SEVERITY(I);
+    END;
+END VALIDATE_ALL;
+
+END FLXSEDIMNT;

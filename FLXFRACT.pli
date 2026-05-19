@@ -1,0 +1,284 @@
+/* ================================================================== */
+/* FLXFRACT.pli — FRACTURE-COALESCE: Split constraints into blocks   */
+/* via BFS on adjacency. Coalesce results via BOOL (bitwise OR).      */
+/*                                                                    */
+/* PL/I's native BIT matrix makes adjacency trivial: ADJ(I,J) BIT(1) */
+/* is the exact type for "are these constraints connected?"           */
+/* BOOL builtin does bitwise OR for coalescence — no shifting needed. */
+/* ================================================================== */
+
+FLXFRACT: PROCEDURE OPTIONS(MAIN);
+
+    /* ---- Constants ---- */
+    DECLARE MAX_C FIXED BIN(8) INIT(8);
+
+    /* ---- Constraint structure ---- */
+    DECLARE 1 CONSTRAINTS(8),
+        2 LO        DEC FIXED(15,4),
+        2 HI        DEC FIXED(15,4),
+        2 SEVERITY  FIXED BIN(8),
+        2 VIOLATED  BIT(1),
+        2 NAME      CHAR(16);
+
+    DECLARE INPUT_VALUES(8) DEC FIXED(15,4);
+    DECLARE CONSTRAINT_COUNT FIXED BIN(8) INIT(0);
+
+    /* ---- Adjacency matrix: NATIVE BIT ---- */
+    /* ADJ(I,J) = '1'B means constraints I and J share a dimension */
+    DECLARE ADJ(8,8) BIT(1) INIT((8)((8)'0'B));
+
+    /* ---- Block assignment ---- */
+    DECLARE CONSTRAINT_BLOCK(8) FIXED BIN(8) INIT((8)0);
+    DECLARE BLOCK_COUNT FIXED BIN(8) INIT(0);
+
+    /* ---- Block results ---- */
+    DECLARE 1 BLOCK_RESULT(8),
+        2 BLK_ERROR_MASK BIT(8) INIT((8)'00000000'B),
+        2 BLK_VIOLATED   FIXED BIN(8) INIT((8)0),
+        2 BLK_PASSED     BIT(1) INIT((8)'1'B);
+
+    /* ---- Global result ---- */
+    DECLARE 1 RESULT,
+        2 ERROR_MASK  BIT(8),
+        2 VIOLATED    FIXED BIN(8),
+        2 SEVERITY    FIXED BIN(8),
+        2 PASSED      BIT(1);
+
+    /* ---- Dependency matrix: which constraint touches which dimension ---- */
+    DECLARE DEP(8,8) BIT(1) INIT((8)((8)'0'B));
+
+    /* ---- BFS work area ---- */
+    DECLARE BFS_QUEUE(8) FIXED BIN(8) INIT((8)0);
+    DECLARE (BFS_HEAD, BFS_TAIL) FIXED BIN(8);
+    DECLARE VISITED(8) BIT(1) INIT((8)'0'B);
+    DECLARE (CURRENT, NEIGHBOR) FIXED BIN(8);
+    DECLARE (DIM_IDX, CON_IDX) FIXED BIN(8);
+    DECLARE (I, J) FIXED BIN(8);
+    DECLARE BIT_POS FIXED BIN(8);
+    DECLARE TEMP_BIT BIT(8);
+
+    /* ================================================================ */
+    /* MAIN: self-test                                                  */
+    /* ================================================================ */
+    PUT SKIP LIST('FLXFRACT — Fracture-Coalesce Engine (PL/I) v1.0');
+    PUT SKIP LIST('================================================');
+    CALL SELF_TEST;
+
+    /* ================================================================ */
+    /* SELF_TEST                                                        */
+    /* ================================================================ */
+SELF_TEST: PROCEDURE;
+
+    /* TEST 1: Fully connected — all 4 constraints share dimensions */
+    /* C1: dims 1,2  C2: dims 3,4  C3: dims 1,3  C4: dims 2,4      */
+    /* => C1-C3 (dim1), C1-C4 (dim2), C2-C3 (dim3), C2-C4 (dim4)   */
+    /* => All connected => 1 block                                    */
+    CONSTRAINT_COUNT = 4;
+
+    DEP(1,1) = '0'B;  DEP(1,2) = '1'B;  DEP(1,3) = '0'B;  DEP(1,4) = '0'B;
+    DEP(2,1) = '0'B;  DEP(2,2) = '0'B;  DEP(2,3) = '1'B;  DEP(2,4) = '1'B;
+    DEP(3,1) = '1'B;  DEP(3,2) = '0'B;  DEP(3,3) = '1'B;  DEP(3,4) = '0'B;
+    DEP(4,1) = '0'B;  DEP(4,2) = '1'B;  DEP(4,3) = '0'B;  DEP(4,4) = '1'B;
+
+    CALL BUILD_ADJACENCY;
+    CALL FRACTURE;
+
+    IF BLOCK_COUNT = 1 THEN
+        PUT SKIP LIST('  PASS: Test 1 (fully connected = 1 block)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 1 (expected 1 block, got ' || BLOCK_COUNT || ')');
+
+    /* TEST 2: Independent — each constraint on its own dimension */
+    /* C1: dim1  C2: dim2  C3: dim3  C4: dim4 => 4 blocks        */
+    DO I = 1 TO 8;
+        DO J = 1 TO 8;
+            DEP(I,J) = '0'B;
+        END;
+    END;
+    DEP(1,1) = '1'B;
+    DEP(2,2) = '1'B;
+    DEP(3,3) = '1'B;
+    DEP(4,4) = '1'B;
+
+    CALL BUILD_ADJACENCY;
+    CALL FRACTURE;
+
+    IF BLOCK_COUNT = 4 THEN
+        PUT SKIP LIST('  PASS: Test 2 (independent = 4 blocks)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 2 (expected 4 blocks, got ' || BLOCK_COUNT || ')');
+
+    /* TEST 3: Coalesce — violations in independent blocks */
+    LO(1) = 0;   HI(1) = 100;  SEVERITY(1) = 1;
+    LO(2) = 0;   HI(2) = 100;  SEVERITY(2) = 2;
+    LO(3) = 0;   HI(3) = 100;  SEVERITY(3) = 1;
+    LO(4) = 0;   HI(4) = 100;  SEVERITY(4) = 3;
+
+    INPUT_VALUES(1) = 50;    /* in bounds */
+    INPUT_VALUES(2) = 200;   /* violates */
+    INPUT_VALUES(3) = 50;    /* in bounds */
+    INPUT_VALUES(4) = -10;   /* violates */
+
+    CALL COALESCE_RESULTS;
+
+    IF PASSED = '0'B THEN
+        PUT SKIP LIST('  PASS: Test 3 (coalesce caught ' || VIOLATED || ' violations)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 3 (coalesce should catch violations)');
+
+    /* TEST 4: Two partial blocks */
+    /* C1: dims 1,2  C2: dims 1,2  C3: dims 3  C4: dims 3 */
+    /* => {C1,C2} and {C3,C4} = 2 blocks */
+    DO I = 1 TO 8;
+        DO J = 1 TO 8;
+            DEP(I,J) = '0'B;
+        END;
+    END;
+    DEP(1,1) = '1'B;  DEP(1,2) = '1'B;
+    DEP(2,1) = '1'B;  DEP(2,2) = '1'B;
+    DEP(3,3) = '1'B;
+    DEP(4,3) = '1'B;
+
+    CALL BUILD_ADJACENCY;
+    CALL FRACTURE;
+
+    IF BLOCK_COUNT = 2 THEN
+        PUT SKIP LIST('  PASS: Test 4 (two blocks = 2)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 4 (expected 2, got ' || BLOCK_COUNT || ')');
+
+    PUT SKIP LIST('Self-test complete.');
+
+END SELF_TEST;
+
+    /* ================================================================ */
+    /* BUILD_ADJACENCY: Two constraints adjacent if they share dims     */
+    /* ADJ(I,J) = '1'B if any dimension K has DEP(I,K)=DEP(J,K)='1'B  */
+    /* Uses BOOL AND to test overlap                                    */
+    /* ================================================================ */
+BUILD_ADJACENCY: PROCEDURE;
+    DECLARE OVERLAP BIT(1);
+    DO I = 1 TO CONSTRAINT_COUNT;
+        DO J = 1 TO CONSTRAINT_COUNT;
+            ADJ(I,J) = '0'B;
+            IF I ^= J THEN
+                DO DIM_IDX = 1 TO 8;
+                    /* Both depend on same dimension */
+                    IF DEP(I, DIM_IDX) = '1'B & DEP(J, DIM_IDX) = '1'B THEN
+                        DO;
+                            ADJ(I,J) = '1'B;
+                            DIM_IDX = 8;  /* exit loop */
+                        END;
+                END;
+        END;
+    END;
+END BUILD_ADJACENCY;
+
+    /* ================================================================ */
+    /* FRACTURE: BFS to find connected components (= independent blocks)*/
+    /* ================================================================ */
+FRACTURE: PROCEDURE;
+    BLOCK_COUNT = 0;
+    DO I = 1 TO MAX_C;
+        CONSTRAINT_BLOCK(I) = 0;
+        VISITED(I) = '0'B;
+    END;
+
+    DO I = 1 TO CONSTRAINT_COUNT;
+        IF VISITED(I) = '0'B THEN
+            DO;
+                BLOCK_COUNT = BLOCK_COUNT + 1;
+                CALL BFS_EXPAND(I);
+            END;
+    END;
+END FRACTURE;
+
+    /* ================================================================ */
+    /* BFS_EXPAND: Expand one connected component from node START       */
+    /* Uses array-based BFS queue (no recursion)                        */
+    /* ================================================================ */
+BFS_EXPAND: PROCEDURE(START);
+    DECLARE START FIXED BIN(8);
+
+    BFS_HEAD = 1;
+    BFS_TAIL = 1;
+    BFS_QUEUE(1) = START;
+    VISITED(START) = '1'B;
+    CONSTRAINT_BLOCK(START) = BLOCK_COUNT;
+
+    DO WHILE(BFS_HEAD <= BFS_TAIL);
+        CURRENT = BFS_QUEUE(BFS_HEAD);
+        BFS_HEAD = BFS_HEAD + 1;
+
+        DO NEIGHBOR = 1 TO CONSTRAINT_COUNT;
+            IF VISITED(NEIGHBOR) = '0'B THEN
+                IF ADJ(CURRENT, NEIGHBOR) = '1'B THEN
+                    DO;
+                        VISITED(NEIGHBOR) = '1'B;
+                        CONSTRAINT_BLOCK(NEIGHBOR) = BLOCK_COUNT;
+                        BFS_TAIL = BFS_TAIL + 1;
+                        BFS_QUEUE(BFS_TAIL) = NEIGHBOR;
+                    END;
+        END;
+    END;
+END BFS_EXPAND;
+
+    /* ================================================================ */
+    /* COALESCE_RESULTS: Check each block, OR masks together            */
+    /* THEOREM: BOOL OR of independent block masks = exact result       */
+    /* PL/I's BOOL builtin is the bitwise OR operator for BIT strings   */
+    /* '1111'B truth table = OR (built into the language!)              */
+    /* ================================================================ */
+COALESCE_RESULTS: PROCEDURE;
+    DECLARE WORK_VAL DEC FIXED(15,4);
+    DECLARE SET_BIT BIT(8);
+
+    /* Initialize result */
+    ERROR_MASK = '00000000'B;
+    VIOLATED = 0;
+    SEVERITY = 0;
+    PASSED = '1'B;
+
+    /* Initialize block results */
+    DO I = 1 TO MAX_C;
+        BLK_ERROR_MASK(I) = '00000000'B;
+        BLK_VIOLATED(I) = 0;
+        BLK_PASSED(I) = '1'B;
+    END;
+
+    /* Check each constraint against its block */
+    DO I = 1 TO CONSTRAINT_COUNT;
+        CON_IDX = CONSTRAINT_BLOCK(I);
+        WORK_VAL = INPUT_VALUES(I);
+
+        IF WORK_VAL < LO(I) | WORK_VAL > HI(I) THEN
+            DO;
+                BLK_VIOLATED(CON_IDX) = BLK_VIOLATED(CON_IDX) + 1;
+                BLK_PASSED(CON_IDX) = '0'B;
+
+                /* Set bit I in this block's mask */
+                SET_BIT = '00000000'B;
+                SUBSTR(SET_BIT, I, 1) = '1'B;
+                BLK_ERROR_MASK(CON_IDX) =
+                    BOOL(BLK_ERROR_MASK(CON_IDX), SET_BIT, '1111'B);
+            END;
+    END;
+
+    /* Coalesce: BOOL OR all block masks together */
+    DO I = 1 TO BLOCK_COUNT;
+        /* BOOL with '1111'B truth table = bitwise OR */
+        ERROR_MASK = BOOL(ERROR_MASK, BLK_ERROR_MASK(I), '1111'B);
+        VIOLATED = VIOLATED + BLK_VIOLATED(I);
+        IF BLK_PASSED(I) = '0'B THEN
+            PASSED = '0'B;
+    END;
+
+    /* Compute total severity from coalesced mask */
+    DO I = 1 TO CONSTRAINT_COUNT;
+        IF SUBSTR(ERROR_MASK, I, 1) = '1'B THEN
+            SEVERITY = SEVERITY + SEVERITY(I);
+    END;
+
+END COALESCE_RESULTS;
+
+END FLXFRACT;

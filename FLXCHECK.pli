@@ -1,0 +1,262 @@
+/* ================================================================== */
+/* FLXCHECK.pli — THE CORE: Exact DECIMAL bounds checking with native */
+/* BIT strings. PL/I's BIT(8) type makes the error mask a first-class */
+/* citizen — no simulation, no shifting, just BOOL.                   */
+/*                                                                    */
+/* Key insight: PL/I had native BIT strings with BOOL operations      */
+/* before C had a standard library. The error mask isn't simulated    */
+/* — it's a native data type.                                         */
+/* ================================================================== */
+
+FLXCHECK: PROCEDURE OPTIONS(MAIN);
+
+    /* ---- Constants ---- */
+    DECLARE INT8_MIN DEC FIXED(15,4) INIT(-128);
+    DECLARE INT8_MAX DEC FIXED(15,4) INIT(127);
+    DECLARE MAX_CONSTRAINTS FIXED BIN(8) INIT(8);
+
+    /* ---- Constraint structure: one per dimension ---- */
+    DECLARE 1 CONSTRAINTS(8),
+        2 LO        DEC FIXED(15,4),
+        2 HI        DEC FIXED(15,4),
+        2 SEVERITY  FIXED BIN(8),
+        2 VIOLATED  BIT(1),
+        2 NAME      CHAR(16);
+
+    /* ---- Sensor inputs: 8 values, INT8 saturated ---- */
+    DECLARE INPUT_VALUES(8) DEC FIXED(15,4);
+    DECLARE CONSTRAINT_COUNT FIXED BIN(8) INIT(0);
+
+    /* ---- Result ---- */
+    DECLARE 1 RESULT,
+        2 ERROR_MASK  BIT(8),       /* THE KEY: native BIT string */
+        2 VIOLATED    FIXED BIN(8),
+        2 SEVERITY    FIXED BIN(8),
+        2 PASSED      BIT(1);
+
+    /* ---- Work variables ---- */
+    DECLARE (I, J) FIXED BIN(8);
+    DECLARE WORK_VAL DEC FIXED(15,4);
+    DECLARE BIT_POS FIXED BIN(8);
+    DECLARE SEV_SUM  FIXED BIN(8) INIT(0);
+    DECLARE MASK_BIT BIT(8);
+
+    /* ---- NaN trap: ON CONVERSION catches invalid data ---- */
+    DECLARE CONV_FLAG BIT(1) INIT('0'B);
+
+    /* ================================================================ */
+    /* ON CONVERSION: PL/I's exception mechanism catches bad data       */
+    /* Analogous to NaN trapping — sets VIOLATED flag and continues     */
+    /* ================================================================ */
+    ON CONVERSION BEGIN;
+        PUT SKIP LIST('*** CONVERSION ERROR: invalid data detected');
+        CONV_FLAG = '1'B;
+    END;
+
+    /* ================================================================ */
+    /* MAIN: self-test                                                  */
+    /* ================================================================ */
+    PUT SKIP LIST('FLXCHECK — Flux Constraint Engine (PL/I) v1.0');
+    PUT SKIP LIST('================================================');
+    CALL SELF_TEST;
+
+    /* ================================================================ */
+    /* SELF_TEST: adversarial and boundary inputs                       */
+    /* ================================================================ */
+SELF_TEST: PROCEDURE;
+
+    /* ---- Setup 3 constraints ---- */
+    CALL INIT_CONSTRAINTS;
+
+    /* Constraint 1: temperature */
+    CONSTRAINT_COUNT = 1;
+    LO(1) = -40;  HI(1) = 85;  SEVERITY(1) = 1;
+    NAME(1) = 'temperature';
+
+    /* Constraint 2: pressure */
+    CONSTRAINT_COUNT = 2;
+    LO(2) = 800;  HI(2) = 1200;  SEVERITY(2) = 2;
+    NAME(2) = 'pressure';
+
+    /* Constraint 3: voltage */
+    CONSTRAINT_COUNT = 3;
+    LO(3) = 0;  HI(3) = 50;  SEVERITY(3) = 1;
+    NAME(3) = 'voltage';
+
+    /* TEST 1: All values in bounds */
+    INPUT_VALUES(1) = 25;
+    INPUT_VALUES(2) = 900;
+    INPUT_VALUES(3) = 12;
+    CALL VALIDATE_ALL;
+    IF PASSED = '1'B THEN
+        PUT SKIP LIST('  PASS: Test 1 (all in bounds)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 1 (all pass)');
+
+    /* TEST 2: Temperature violation */
+    INPUT_VALUES(1) = 100;
+    CALL VALIDATE_ALL;
+    IF PASSED = '0'B THEN
+        PUT SKIP LIST('  PASS: Test 2 (temp caught)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 2 (temp violation missed)');
+
+    /* TEST 3: Boundary — exactly at LO */
+    INPUT_VALUES(1) = -40;
+    CALL VALIDATE_ALL;
+    IF PASSED = '1'B THEN
+        PUT SKIP LIST('  PASS: Test 3 (boundary LO pass)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 3 (boundary LO)');
+
+    /* TEST 4: Boundary — exactly at HI */
+    INPUT_VALUES(1) = 85;
+    CALL VALIDATE_ALL;
+    IF PASSED = '1'B THEN
+        PUT SKIP LIST('  PASS: Test 4 (boundary HI pass)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 4 (boundary HI)');
+
+    /* TEST 5: Off-by-one below LO */
+    INPUT_VALUES(1) = -41;
+    CALL VALIDATE_ALL;
+    IF PASSED = '0'B THEN
+        PUT SKIP LIST('  PASS: Test 5 (off-by-one LO caught)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 5 (off-by-one LO missed)');
+
+    /* TEST 6: Off-by-one above HI */
+    INPUT_VALUES(1) = 86;
+    CALL VALIDATE_ALL;
+    IF PASSED = '0'B THEN
+        PUT SKIP LIST('  PASS: Test 6 (off-by-one HI caught)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 6 (off-by-one HI missed)');
+
+    /* TEST 7: INT8 saturation — negative */
+    INPUT_VALUES(1) = -200;
+    CALL SATURATE_SENSORS;
+    IF INPUT_VALUES(1) = INT8_MIN THEN
+        PUT SKIP LIST('  PASS: Test 7 (INT8 saturate negative)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 7 (INT8 saturate)');
+
+    /* TEST 8: INT8 saturation — positive */
+    INPUT_VALUES(1) = 200;
+    CALL SATURATE_SENSORS;
+    IF INPUT_VALUES(1) = INT8_MAX THEN
+        PUT SKIP LIST('  PASS: Test 8 (INT8 saturate positive)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 8 (INT8 saturate)');
+
+    /* TEST 9: Multiple violations */
+    INPUT_VALUES(1) = 100;
+    INPUT_VALUES(2) = 500;
+    INPUT_VALUES(3) = 60;
+    CALL VALIDATE_ALL;
+    IF VIOLATED = 3 THEN
+        PUT SKIP LIST('  PASS: Test 9 (3 violations)');
+    ELSE
+        PUT SKIP LIST('  FAIL: Test 9 (expected 3, got ' || VIOLATED || ')');
+
+    PUT SKIP LIST('Self-test complete.');
+
+END SELF_TEST;
+
+    /* ================================================================ */
+    /* INIT_CONSTRAINTS: zero out all constraint data                   */
+    /* ================================================================ */
+INIT_CONSTRAINTS: PROCEDURE;
+    DO I = 1 TO MAX_CONSTRAINTS;
+        LO(I) = 0;
+        HI(I) = 0;
+        SEVERITY(I) = 0;
+        VIOLATED(I) = '0'B;
+        NAME(I) = '';
+        INPUT_VALUES(I) = 0;
+    END;
+END INIT_CONSTRAINTS;
+
+    /* ================================================================ */
+    /* VALIDATE_ALL: Full pipeline — saturate, check, compute severity  */
+    /* ================================================================ */
+VALIDATE_ALL: PROCEDURE;
+    ERROR_MASK = '00000000'B;
+    VIOLATED = 0;
+    SEVERITY = 0;
+    PASSED = '1'B;
+    CONV_FLAG = '0'B;
+
+    CALL SATURATE_SENSORS;
+    CALL CHECK_CONSTRAINTS;
+    CALL COMPUTE_SEVERITY;
+END VALIDATE_ALL;
+
+    /* ================================================================ */
+    /* SATURATE_SENSORS: Clamp all inputs to INT8 range                 */
+    /* PL/I's DEC FIXED arithmetic is EXACT — no rounding needed       */
+    /* ================================================================ */
+SATURATE_SENSORS: PROCEDURE;
+    DO I = 1 TO CONSTRAINT_COUNT;
+        IF INPUT_VALUES(I) < INT8_MIN THEN
+            INPUT_VALUES(I) = INT8_MIN;
+        IF INPUT_VALUES(I) > INT8_MAX THEN
+            INPUT_VALUES(I) = INT8_MAX;
+    END;
+END SATURATE_SENSORS;
+
+    /* ================================================================ */
+    /* CHECK_CONSTRAINTS: Compare each sensor value to its bounds       */
+    /* Uses SUBSTR on native BIT(8) to set individual bits              */
+    /* ================================================================ */
+CHECK_CONSTRAINTS: PROCEDURE;
+    DECLARE TEMP_MASK CHAR(8);
+    DO I = 1 TO CONSTRAINT_COUNT;
+        WORK_VAL = INPUT_VALUES(I);
+        IF WORK_VAL < LO(I) | WORK_VAL > HI(I) THEN
+            DO;
+                VIOLATED(I) = '1'B;
+                VIOLATED = VIOLATED + 1;
+                PASSED = '0'B;
+                /* Set bit position (8-I) in the BIT(8) mask */
+                /* BIT(8) is MSB-first: bit 1 = constraint 1 */
+                CALL SET_BIT(I);
+            END;
+    END;
+END CHECK_CONSTRAINTS;
+
+    /* ================================================================ */
+    /* SET_BIT: Set bit N in ERROR_MASK using SUBSTR                    */
+    /* PL/I BIT strings are 1-indexed, MSB first                        */
+    /* ================================================================ */
+SET_BIT: PROCEDURE(N);
+    DECLARE N FIXED BIN(8);
+    DECLARE MASK_STR CHAR(8);
+    DECLARE BIT_ONE CHAR(1) INIT('1');
+    DECLARE BIT_ZERO CHAR(1) INIT('0');
+    DECLARE OUT BIT(8);
+
+    /* Build mask: position N set, rest zero */
+    OUT = '00000000'B;
+    /* SUBSTR replaces position N in the BIT string */
+    SUBSTR(OUT, N, 1) = '1'B;
+
+    /* OR it into ERROR_MASK using BOOL builtin */
+    ERROR_MASK = BOOL(ERROR_MASK, OUT, '1111'B);
+        /* '1111'B = OR truth table for BOOL builtin */
+END SET_BIT;
+
+    /* ================================================================ */
+    /* COMPUTE_SEVERITY: Sum severities of violated constraints         */
+    /* Test each bit in ERROR_MASK using SUBSTR                         */
+    /* ================================================================ */
+COMPUTE_SEVERITY: PROCEDURE;
+    SEV_SUM = 0;
+    DO I = 1 TO CONSTRAINT_COUNT;
+        IF SUBSTR(ERROR_MASK, I, 1) = '1'B THEN
+            SEV_SUM = SEV_SUM + SEVERITY(I);
+    END;
+    SEVERITY = SEV_SUM;
+END COMPUTE_SEVERITY;
+
+END FLXCHECK;

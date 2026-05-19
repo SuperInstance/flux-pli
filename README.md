@@ -1,47 +1,72 @@
-# flux-pli — PL/I Constraint Engine
+# Flux PL/I — What Native BIT Strings Teach About Error Masks
 
-## What PL/I's BIT Strings Teach About Constraint Engines
+PL/I (Programming Language One, 1964) was IBM's attempt to unite scientific (Fortran) and business (COBOL) computing in a single language. It runs on IBM mainframes and has a Linux compiler (Iron Spring). This repo implements the Flux constraint engine in PL/I.
 
-PL/I (Programming Language One, 1964) was IBM's attempt to unite scientific
-(Fortran) and business (COBOL) computing in a single language. What makes it
-remarkable for constraint engines is **native BIT strings** — the error mask
-isn't simulated, it's a first-class data type.
+## How to Read PL/I
 
-### The Key Insight
+PL/I reads like a more rigorous C with better type declarations — despite predating C by six years.
 
-Every constraint engine needs an error mask: which constraints are violated.
-In most languages, this is built from integer bitwise operations:
+```pli
+/* This is a comment */
 
-| Language | Error Mask Implementation |
-|----------|--------------------------|
-| C        | `uint8_t mask |= (1 << i)` — shift and OR |
-| Python   | `mask |= (1 << i)` — same, slower |
-| Rust     | `mask |= 1u8 << i` — same, safer |
-| COBOL    | `ADD BIT-VAL TO RESULT-ERROR-MASK` — arithmetic simulation |
-| **PL/I** | `SUBSTR(MASK, I, 1) = '1'B` — **native bit string** |
+DECLARE X FIXED BINARY(15);           /* 15-bit signed integer */
+DECLARE Y DEC FIXED(15,4);            /* Exact decimal: 15 digits, 4 after point */
+DECLARE MASK BIT(8);                  /* 8 bits — native bit string */
+DECLARE NAME CHAR(32);                /* Fixed-length character string */
 
-PL/I doesn't simulate bitmasks. `BIT(8)` IS a bitmask. `BOOL(A, B, '1111'B)`
-IS bitwise OR. This was true in 1964 — before C existed.
+/* Structures — like C structs */
+DECLARE 1 CONSTRAINT,
+    2 LO    DEC FIXED(15,4),          /* Lower bound — exact decimal */
+    2 HI    DEC FIXED(15,4),          /* Upper bound */
+    2 SEV   FIXED BIN(8),             /* Severity */
+    2 VIOLATED BIT(1);                /* Single bit: violated or not */
 
-### What PL/I Gets Right
+/* Arrays of structures */
+DECLARE CONSTRAINTS(8) LIKE CONSTRAINT;
 
-1. **BIT(n) is a native type** — not an integer you shift, but a string of bits
-   you address by position with `SUBSTR`. The error mask is declarative.
+/* Bit operations — native, not simulated */
+SUBSTR(MASK, 3, 1) = '1'B;           /* Set bit 3 — bit 3 is '1' Bit */
 
-2. **BOOL builtin** — `BOOL(A, B, truth_table)` does arbitrary bitwise logic.
-   `'1111'B` = OR, `'1000'B` = AND, `'0110'B` = XOR. The truth table IS the
-   operation. No operator overloading needed.
+/* BOOL — arbitrary bitwise logic via truth table */
+/* BOOL(A, B, '1111'B) = OR, '1000'B = AND, '0110'B = XOR */
+MASK = BOOL(BLOCK1_MASK, BLOCK2_MASK, '1111'B);  /* OR */
 
-3. **DEC FIXED(p,q)** — exact decimal arithmetic. No floating-point drift in
-   constraint bounds. When you say LO = -40.0 and HI = 85.0, that's exact.
+/* Control flow */
+DO I = 1 TO 8;
+  IF SENSOR_VAL < CONSTRAINTS(I).LO THEN
+    SUBSTR(MASK, I, 1) = '1'B;
+END;
 
-4. **ON CONVERSION** — exception mechanism that traps invalid data conversion
-   (PL/I's NaN analog). Install a handler, catch bad data, continue.
+/* Procedures */
+CHECK: PROCEDURE(VAL, IDX);
+  DECLARE VAL DEC FIXED(15,4);
+  DECLARE IDX FIXED BINARY(8);
+  /* ... logic ... */
+END CHECK;
 
-5. **STRUCTURE** — COBOL-style records for constraint definitions. Group LO,
-   HI, SEVERITY, VIOLATED in one structure — self-documenting data layout.
+/* Exception handling */
+ON CONVERSION BEGIN;   /* Trap invalid data (PL/I's NaN analog) */
+  /* handle bad conversion */
+END;
+```
 
-### Architecture
+Key ideas:
+- **`BIT(n)` is a native type** — not an integer you shift, but a string of bits you address by position with `SUBSTR`.
+- **`BOOL(A, B, truth_table)`** — arbitrary bitwise logic. The truth table IS the operation. `'1111'B` = OR, `'1000'B` = AND.
+- **`DEC FIXED(p,q)`** — exact decimal arithmetic. No floating-point drift.
+- **`ON CONDITION`** — exception handling. `ON CONVERSION` traps invalid data.
+- **Structures** — COBOL-style records. Self-documenting data layout.
+
+## How the Constraint Engine Maps to PL/I
+
+| Constraint Engine Concept | PL/I Mechanism |
+|---------------------------|----------------|
+| Error mask (8 bits) | `BIT(8)` — native bit string, not simulated |
+| Bitwise OR coalescence | `BOOL(M1, M2, '1111'B)` — truth-table OR |
+| Constraint bounds | `DEC FIXED(15,4)` — exact decimal, zero drift |
+| Single constraint violated | `BIT(1)` field in structure |
+| Exception on bad data | `ON CONVERSION` handler |
+| Pipeline stages | `PROCEDURE` blocks |
 
 ```
 FLXCHECK.pli    — Core engine: bounds check, BIT(8) mask, severity
@@ -50,94 +75,62 @@ FLXSEDIMNT.pli  — Sediment layers: stack of bound corrections
 FLXMAIN.pli     — Integration test: 30 assertions across 8 phases
 ```
 
-### The Error Mask in PL/I
+## What PL/I Teaches Us
+
+**The error mask should be a native type, not a simulation.** Every other language builds bitmasks from integer shift-and-OR. PL/I's `BIT(8)` IS the mask. There's no conceptual gap between "I need 8 bits" and the type declaration.
+
+Compare:
+
+```c
+/* C — simulate the mask */
+uint8_t mask = 0;
+mask |= (1 << 2);           /* bit 3 = constraint 3 */
+mask = block1 | block2;     /* OR coalescence */
+```
 
 ```pli
-DECLARE ERROR_MASK BIT(8);           /* 8 bits, one per constraint */
-DECLARE CONSTRAINTS(8) STRUCTURE(
-    LO DEC FIXED(15,4),
-    HI DEC FIXED(15,4),
-    SEVERITY FIXED BIN(8),
-    VIOLATED BIT(1));
-
-/* Set bit 3 (constraint 3 violated) */
-SUBSTR(ERROR_MASK, 3, 1) = '1'B;
-
-/* Coalesce two block masks via OR */
-ERROR_MASK = BOOL(BLOCK_MASK_1, BLOCK_MASK_2, '1111'B);
+/* PL/I — the mask IS the type */
+DECLARE MASK BIT(8);
+SUBSTR(MASK, 3, 1) = '1'B;                    /* bit 3 = constraint 3 */
+MASK = BOOL(BLOCK1, BLOCK2, '1111'B);          /* OR coalescence */
 ```
 
-Compare with C:
-```c
-uint8_t error_mask = 0;
-error_mask |= (1 << 2);  /* bit 3 = constraint 3 */
-error_mask = block_mask_1 | block_mask_2;
-```
+The C version works. The PL/I version *declares intent*. `BIT(8)` doesn't just hold the data — it IS the data.
 
-The C version works. The PL/I version *declares intent*. The BIT string
-doesn't just hold the data — it IS the data. There's no conceptual gap
-between "I need 8 bits" and `BIT(8)`.
+Three specific lessons:
 
-### BOOL Truth Tables
+1. **BOOL truth tables are the universal bitwise operation.** `BOOL(A, B, '1111'B)` is OR. `'1000'B` is AND. `'0110'B` is XOR. The 4-bit truth table encodes ANY binary Boolean function in one call. This is more general than any operator overloading.
 
-PL/I's `BOOL(A, B, truth_table)` uses a 4-bit truth table where each bit
-represents the output for a combination of input bits:
+2. **DEC FIXED eliminates IEEE 754 surprises.** When you say LO = -40.0 and HI = 85.0, that's exact — not "close enough." The constraint engine needs this. A bounds check that fails because of floating-point representation is a false violation.
 
-| A | B | OR ('1111'B) | AND ('1000'B) | XOR ('0110'B) |
-|---|---|-------------|--------------|--------------|
-| 0 | 0 | 0           | 0            | 0            |
-| 0 | 1 | 1           | 0            | 1            |
-| 1 | 0 | 1           | 0            | 1            |
-| 1 | 1 | 1           | 1            | 0            |
+3. **ON CONVERSION is constraint-safe error handling.** Invalid data doesn't crash or silently corrupt — it triggers a handler you define. This is the same pattern as the constraint engine's per-constraint violation tracking.
 
-The truth table is literally the output column read as a binary number.
-`'1111'B` = 15 = OR. This is elegant — any binary Boolean function in one call.
+## Theorem: Coalescence Correctness
 
-### Theorem: Coalescence Correctness
+If fracture correctly identifies connected components of the constraint-dimension dependency graph, coalescence via bitwise OR preserves zero false negatives. Each constraint violation is a Boolean event. For independent blocks, event spaces are disjoint. Union = OR.
 
-**Bitwise OR of independent block error masks = exact global error mask.**
+PL/I's `BOOL(M1, M2, '1111'B)` IS this theorem, expressed as a single builtin function call.
 
-Proof: Each constraint belongs to exactly one block (BFS partitioning).
-Each violated constraint sets exactly one bit. OR preserves all set bits
-from all operands. Therefore no violation is lost (zero false negatives)
-and no violation is invented (zero false positives). QED.
+## Files
 
-PL/I's `BOOL(M1, M2, '1111'B)` IS this theorem, expressed as a single
-builtin function call.
+| File | Purpose |
+|------|---------|
+| `FLXCHECK.pli` | Core engine: bounds check, BIT(8) mask, severity |
+| `FLXFRACT.pli` | Fracture-coalesce: BFS blocks, BOOL OR coalescence |
+| `FLXSEDIMNT.pli` | Sediment layers: stack of bound corrections |
+| `FLXMAIN.pli` | Integration test: 30 assertions across 8 phases |
 
-### Fracture-Coalesce Pattern
+## Build & Run
 
-```
-1. Build adjacency: ADJ(I,J) = '1'B if constraints share a dimension
-2. BFS to find connected components (independent blocks)
-3. Check each block independently
-4. BOOL OR the block masks together → exact result
-```
+PL/I requires a compiler — IBM PL/I for MVS, Open PL/I (Linux), or Iron Spring PL/I. The syntax follows PL/I standard conventions (DECLARE, PROCEDURE, DO, IF-THEN-ELSE, SELECT, ON CONDITION, PUT SKIP LIST).
 
-The BFS uses native BIT(1) for both the adjacency matrix and visited array.
-PL/I was born to do this.
+## Where to Go Next
 
-### Sediment Layers
+- **flux-cobol** — COBOL uses arithmetic to simulate the bitmask. PL/I shows what happens when the mask is native.
+- **flux-rpg** — RPG's indicators (*IN01–*IN08) are the same concept in a different form — boolean flags as error mask bits.
+- **flux-snobol** — SNOBOL4 takes the opposite approach: no mask variable at all. The control flow IS the mask.
+- **flux-docs** — Full documentation: error masks, fracture-coalesce, sediment, thermodynamic analogy.
 
-Corrections to constraint bounds accumulate as geological layers:
-- **PUSH_LAYER**: Add a correction on top of the stack
-- **APPLY_SEDIMENT**: Apply all active layers bottom-to-top
-- **POP_LAYER**: Remove top layer, revert bounds
+## Author
 
-The stack uses PL/I array indexing — no dynamic allocation needed for
-the bounded case. Each layer records OLD and NEW bounds for audit trail.
-
-### Running
-
-PL/I requires a compiler. IBM PL/I for MVS, Open PL/I (Linux), or the
-Iron Spring PL/I compiler can handle this code. The syntax follows
-PL/I standard conventions:
-
-- `DECLARE`, `PROCEDURE`, `DO`, `IF-THEN-ELSE`, `SELECT`
-- `ON CONDITION` for exception handling
-- `PUT SKIP LIST` for output
-- `BOOL`, `SUBSTR` builtins for bit manipulation
-
-### License
-
-Part of the Flux Constraint Engine project — SuperInstance
+Forgemaster ⚒️ — Constraint Theory Ecosystem, 2026-05-19
